@@ -6,6 +6,7 @@ use evm_adapters::call_tracing::CallTraceArena;
 
 use evm_adapters::{
     fuzz::{FuzzTestResult, FuzzedCases, FuzzedExecutor},
+    sputnik::helpers::vm,
     Evm, EvmError,
 };
 use eyre::{Context, Result};
@@ -168,6 +169,10 @@ impl<'a, S, E> ContractRunner<'a, S, E> {
 }
 
 impl<'a, S: Clone, E: Evm<S>> ContractRunner<'a, S, E> {
+    pub fn new_evm() -> impl Evm<S> {
+        vm()
+    }
+
     /// Runs all tests for a contract whose names match the provided regular expression
     pub fn run_tests(
         &mut self,
@@ -193,8 +198,8 @@ impl<'a, S: Clone, E: Evm<S>> ContractRunner<'a, S, E> {
             .filter(|func| func.inputs.is_empty())
             .map(|func| {
                 // Before each test run executes, ensure we're at our initial state.
-                self.evm.reset(init_state.clone());
-                let result = self.run_test(func, needs_setup, known_contracts)?;
+                // self.evm.reset(init_state.clone());
+                let result = self.run_test(self.new_evm(), func, needs_setup, known_contracts)?;
                 Ok((func.signature(), result))
             })
             .collect::<Result<BTreeMap<_, _>>>()?;
@@ -228,6 +233,7 @@ impl<'a, S: Clone, E: Evm<S>> ContractRunner<'a, S, E> {
     #[tracing::instrument(name = "test", skip_all, fields(name = %func.signature()))]
     pub fn run_test(
         &mut self,
+        mut evm: impl Evm<S>,
         func: &Function,
         setup: bool,
         known_contracts: Option<&BTreeMap<String, (Abi, Vec<u8>)>>,
@@ -242,43 +248,37 @@ impl<'a, S: Clone, E: Evm<S>> ContractRunner<'a, S, E> {
 
         let mut logs = self.init_logs.to_vec();
 
-        self.evm.reset_traces();
+        evm.reset_traces();
 
         // call the setup function in each test to reset the test's state.
         if setup {
             tracing::trace!("setting up");
-            let setup_logs = self
-                .evm
+            let setup_logs = evm
                 .setup(self.address)
                 .wrap_err(format!("could not setup during {} test", func.signature()))?
                 .1;
             logs.extend_from_slice(&setup_logs);
         }
 
-        let (status, reason, gas_used, logs) = match self.evm.call::<(), _, _>(
-            self.sender,
-            self.address,
-            func.clone(),
-            (),
-            0.into(),
-        ) {
-            Ok((_, status, gas_used, execution_logs)) => {
-                logs.extend(execution_logs);
-                (status, None, gas_used, logs)
-            }
-            Err(err) => match err {
-                EvmError::Execution { reason, gas_used, logs: execution_logs } => {
+        let (status, reason, gas_used, logs) =
+            match evm.call::<(), _, _>(self.sender, self.address, func.clone(), (), 0.into()) {
+                Ok((_, status, gas_used, execution_logs)) => {
                     logs.extend(execution_logs);
-                    // add reverted logs
-                    logs.extend(self.evm.all_logs());
-                    (E::revert(), Some(reason), gas_used, logs)
+                    (status, None, gas_used, logs)
                 }
-                err => {
-                    tracing::error!(?err);
-                    return Err(err.into())
-                }
-            },
-        };
+                Err(err) => match err {
+                    EvmError::Execution { reason, gas_used, logs: execution_logs } => {
+                        logs.extend(execution_logs);
+                        // add reverted logs
+                        logs.extend(self.evm.all_logs());
+                        (E::revert(), Some(reason), gas_used, logs)
+                    }
+                    err => {
+                        tracing::error!(?err);
+                        return Err(err.into())
+                    }
+                },
+            };
 
         let mut traces: Option<Vec<CallTraceArena>> = None;
         let mut identified_contracts: Option<BTreeMap<Address, (String, Abi)>> = None;
