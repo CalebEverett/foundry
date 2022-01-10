@@ -1,15 +1,19 @@
 use crate::{runner::TestResult, ContractRunner};
 use ethers::solc::Artifact;
 
-use evm_adapters::Evm;
-
 use ethers::{
     abi::Abi,
     prelude::ArtifactOutput,
     solc::Project,
     types::{Address, U256},
 };
-
+use evm::backend::MemoryBackend;
+use evm_adapters::{
+    sputnik::cheatcodes::{
+        backend::CheatcodeBackend, memory_stackstate_owned::MemoryStackStateOwned,
+    },
+    Evm,
+};
 use proptest::test_runner::TestRunner;
 use regex::Regex;
 
@@ -31,15 +35,10 @@ pub struct MultiContractRunnerBuilder {
 impl MultiContractRunnerBuilder {
     /// Given an EVM, proceeds to return a runner which is able to execute all tests
     /// against that evm
-    pub fn build<A, E, S>(
-        self,
-        project: Project<A>,
-        mut evm: E,
-    ) -> Result<MultiContractRunner<E, S>>
+    pub fn build<'a, A>(self, project: Project<A>) -> Result<MultiContractRunner<'a>>
     where
         // TODO: Can we remove the static? It's due to the `into_artifacts()` call below
         A: ArtifactOutput + 'static,
-        E: Evm<S>,
     {
         println!("compiling...");
         let output = project.compile()?;
@@ -62,6 +61,8 @@ impl MultiContractRunnerBuilder {
         let mut deployed_contracts: BTreeMap<String, (Abi, Address, Vec<String>)> =
             Default::default();
 
+        let mut evm = evm_adapters::sputnik::helpers::vm();
+
         for (fname, contract) in contracts {
             let (maybe_abi, maybe_deploy_bytes, maybe_runtime_bytes) = contract.into_parts();
             if let (Some(abi), Some(bytecode)) = (maybe_abi, maybe_deploy_bytes) {
@@ -83,14 +84,15 @@ impl MultiContractRunnerBuilder {
             }
         }
 
+        let state = evm.state().clone();
+
         Ok(MultiContractRunner {
             contracts: deployed_contracts,
             known_contracts,
             identified_contracts: Default::default(),
-            evm,
-            state: PhantomData,
             sender: self.sender,
             fuzzer: self.fuzzer,
+            state,
         })
     }
 
@@ -115,7 +117,7 @@ impl MultiContractRunnerBuilder {
 
 /// A multi contract runner receives a set of contracts deployed in an EVM instance and proceeds
 /// to run all test functions in these contracts.
-pub struct MultiContractRunner<E, S> {
+pub struct MultiContractRunner<'a> {
     /// Mapping of contract name to compiled bytecode, deployed address and logs emitted during
     /// deployment
     pub contracts: BTreeMap<String, (Abi, Address, Vec<String>)>,
@@ -123,21 +125,17 @@ pub struct MultiContractRunner<E, S> {
     pub known_contracts: BTreeMap<String, (Abi, Vec<u8>)>,
     /// Identified contracts by test
     pub identified_contracts: BTreeMap<String, BTreeMap<Address, (String, Abi)>>,
-    /// The EVM instance used in the test runner
-    pub evm: E,
+    // The EVM instance used in the test runner
+    // pub evm: E,
     /// The fuzzer which will be used to run parametric tests (w/ non-0 solidity args)
     fuzzer: Option<TestRunner>,
     /// The address which will be used as the `from` field in all EVM calls
     sender: Option<Address>,
-    /// Market type for the EVM state being used
-    state: PhantomData<S>,
+    // Market type for the EVM state being used
+    state: MemoryStackStateOwned<'a, CheatcodeBackend<MemoryBackend<'a>>>,
 }
 
-impl<E, S> MultiContractRunner<E, S>
-where
-    E: Evm<S>,
-    S: Clone,
-{
+impl<'a> MultiContractRunner<'a> {
     pub fn test(
         &mut self,
         pattern: Regex,
@@ -145,11 +143,11 @@ where
         // TODO: Convert to iterator, ideally parallel one?
         let contracts = std::mem::take(&mut self.contracts);
 
-        let init_state: S = self.evm.state().clone();
+        // let init_state: S = self.evm.state().clone();
         let results = contracts
             .iter()
             .map(|(name, (abi, address, logs))| {
-                let result = self.run_tests(name, abi, *address, logs, &pattern, &init_state)?;
+                let result = self.run_tests(name, abi, *address, logs, &pattern)?;
                 Ok((name.clone(), result))
             })
             .filter_map(|x: Result<_>| x.ok())
@@ -175,11 +173,10 @@ where
         address: Address,
         init_logs: &[String],
         pattern: &Regex,
-        init_state: &S,
+        // init_state: &S,
     ) -> Result<BTreeMap<String, TestResult>> {
-        let mut runner =
-            ContractRunner::new(&mut self.evm, contract, address, self.sender, init_logs);
-        runner.run_tests(pattern, self.fuzzer.as_mut(), init_state, Some(&self.known_contracts))
+        let mut runner = ContractRunner::new(contract, address, self.sender, init_logs);
+        runner.run_tests(pattern, self.fuzzer.as_mut(), Some(&self.known_contracts))
     }
 }
 
@@ -205,12 +202,12 @@ mod tests {
             .unwrap()
     }
 
-    fn runner<S: Clone, E: Evm<S>>(evm: E) -> MultiContractRunner<E, S> {
-        MultiContractRunnerBuilder::default().build(project(), evm).unwrap()
+    fn runner<'a>() -> MultiContractRunner<'a> {
+        MultiContractRunnerBuilder::default().build(project()).unwrap()
     }
 
-    fn test_multi_runner<S: Clone, E: Evm<S>>(evm: E) {
-        let mut runner = runner(evm);
+    fn test_multi_runner() {
+        let mut runner = runner();
         let results = runner.test(Regex::new(".*").unwrap()).unwrap();
 
         // 6 contracts being built
@@ -237,7 +234,7 @@ mod tests {
         fn test_sputnik_debug_logs() {
             let evm = vm();
 
-            let mut runner = runner(evm);
+            let mut runner = runner();
             let results = runner.test(Regex::new(".*").unwrap()).unwrap();
 
             let reasons = results["DebugLogsTest"]
@@ -269,7 +266,7 @@ mod tests {
 
         #[test]
         fn test_sputnik_multi_runner() {
-            test_multi_runner(vm());
+            test_multi_runner();
         }
     }
 
